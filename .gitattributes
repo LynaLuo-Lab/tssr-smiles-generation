@@ -1,3 +1,4 @@
 *.txt filter=lfs diff=lfs merge=lfs -text
 data/train.txt filter=lfs diff=lfs merge=lfs -text
 data/train.csv filter=lfs diff=lfs merge=lfs -text
+*.tar.gz filter=lfs diff=lfs merge=lfs -text

@@ -1,0 +1,24 @@
+.git
+.gitignore
+.idea/
+.vscode/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.DS_Store
+.env
+.env.*
+.venv/
+venv/
+env/
+.mamba/
+.conda/
+.cache/
+.ipynb_checkpoints/
+# training outputs
+RLPipeline/runs/
+lightning_logs/
+checkpoints/
+# build artifacts
+dist/
+build/

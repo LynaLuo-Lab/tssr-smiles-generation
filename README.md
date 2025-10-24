@@ -1,66 +1,148 @@
-Drug-Discovery-Loss-Term — Minimal Review Package
+# TSSR-SMILES: Reproducible Package for Sequence-Based Molecular Generation with RL
 
-This directory is a self-contained snapshot intended for code review. It includes:
+This repository provides a compact, reproduction package for the TSSR-SMILES project. It bundles:
+- A pre-built Docker image (tssr-smiles:latest) saved as tssr-smiles.tar.gz in the project root.
+- A one-step launcher script run_docker.sh that automatically loads the image (if needed) and runs curated experiment profiles.
+- The minimal source files required to execute the training and evaluation pipeline end-to-end on the dataset (under data/).
 
-- RunScript.py — the main entry point
-- RLPipeline/ — only the modules imported by RunScript.py
-  - CharRNN.py (CharRNNModel and Critic)
-  - SequenceDataSet.py (SequenceDataset and LabelEncoder)
-  - SequenceEnv.py (SequenceEnv and reward logic)
-  - MeanEvaluation.py (generation evaluation helpers)
-  - BulkGenerator.py (sampling/generation helper)
+You do not need to install Python, CUDA, or RDKit locally. Everything runs inside the provided container.
 
-What’s intentionally excluded
-- Checkpoints, logs, notebooks, large data files, and any modules not imported by RunScript.py.
 
-How to use
-1) Install dependencies (see requirements.txt). A Conda environment is recommended for RDKit.
+## Contents at a glance
+- RunScript.py — main entry point orchestrating pretraining + RL or pure RL.
+- RLPipeline/ — core components used by RunScript.py only:
+  - CharRNN.py — recurrent generator + critic
+  - SequenceDataSet.py — dataset and label encoding
+  - SequenceEnv.py — Gym-style environment + reward logic
+  - MeanEvaluation.py — evaluation helpers (RDKit-based)
+  - BulkGenerator.py — sampling/generation helper
+- data/ — MOSES dataset (one SMILES per line). Files used by default:
+  - data/train.txt, data/test.txt, data/train.csv, data/test.csv
+- Dockerfile, environment.yml — reproducible container build spec (for transparency)
+- entrypoint.sh — profile router used by the image
+- run_docker.sh — convenience wrapper to load and run the pre-built image
+- tssr-smiles.tar.gz — the pre-built Docker image (Linux/amd64)
 
-   Example with pip (Linux/macOS):
-   - python -m venv .venv && source .venv/bin/activate
-   - pip install -r requirements.txt
 
-   Note: rdkit is provided via the rdkit-pypi wheel, which may not support all platforms. If it fails, use Conda:
-   - conda create -n ddrlt python=3.10
-   - conda activate ddrlt
-   - conda install -c conda-forge rdkit
-   - pip install -r requirements.txt --no-deps
+## Scientific overview (brief)
+- Problem: sequence-based molecular generation with reinforcement learning (SMILES strings).
+- Model: character-level RNN generator trained with either (a) pure RL or (b) finetune + RL.
+- Policy optimization: PPO via Tianshou.
+- Evaluation: RDKit-driven filters and metrics (see MeanEvaluation.py), plus sampled molecule dumps.
+- Reproducibility: fixed seeds baked into predefined profiles; deterministic backend settings where applicable.
 
-2) Adjust data paths (if you plan to run training):
-   RunScript.py and some helpers refer to absolute paths like:
-   - /home/abog/PycharmProjects/Drug-Discovery-Loss-Term/data/train.txt
-   - /home/abog/PycharmProjects/Drug-Discovery-Loss-Term/data/test.txt
-   - /home/abog/PycharmProjects/Drug-Discovery-Loss-Term/data/train.csv
-   - /home/abog/PycharmProjects/Drug-Discovery-Loss-Term/data/test.csv
+This package is intended for qualitative and functional review on MOSES dataset. It demonstrates the training loop, 
+reward design, and resulting samples without requiring multi-GPU infrastructure.
 
-   For a quick test or review you can:
-   - Replace these with your local paths, or
-   - Create a data/ directory at the project root and mirror the same files.
 
-3) Import or run
-   - For inspection: open files directly.
-   - For import-only smoke test (does not run training):
-     python -c "import sys; sys.path.insert(0, 'review_repo'); import RunScript"
+## System requirements
+- Docker 24+ on Linux, macOS (Apple Silicon via emulation is slower), or Windows 10/11 with WSL2.
+- Optional GPU acceleration (recommended):
+  - NVIDIA GPU with recent driver and the NVIDIA Container Toolkit (a.k.a. nvidia-docker2) on the host.
+  - Verify with: docker run --rm --gpus all nvidia/cuda:12.1.0-base-ubuntu22.04 nvidia-smi
+- Disk: ~6–10 GB free for the image and outputs.
+- RAM: 8 GB+ (more is better). GPU VRAM: 8 GB+ recommended.
 
-   - To run the full script (this will start pretraining and RL if GPUs/deps are available):
-     cd review_repo
-     python RunScript.py
 
-   CLI arguments:
-   - --seed SEED       Optional integer seed. Default: random per run.
-   - --pure-rl         Run pure RL (skip Lightning pretraining). Default: finetuned RL.
+## Quick start (pre-built Docker image)
+1) Make the launcher executable
+- chmod +x run_docker.sh
 
-   Examples:
-   - Default (finetune + RL, random seed):
-     python RunScript.py
-   - Pure RL with random seed:
-     python RunScript.py --pure-rl
-   - Finetune + RL with fixed seed 1234:
-     python RunScript.py --seed 1234
-   - Pure RL with fixed seed 42:
-     python RunScript.py --pure-rl --seed 42
+2) Show the built-in help and available profiles
+- ./run_docker.sh help
+
+3) Run a PRL profile on GPU (fastest if GPU is available)
+- ./run_docker.sh --gpu PRL-Run1
+
+4) Run on CPU only (slower, but works everywhere)
+- ./run_docker.sh --cpu PRL-Run1
 
 Notes
-- The script uses GPU (if available) via PyTorch Lightning and Tianshou; CPU is supported but slow.
-- Training writes outputs to RLPipeline/runs/<mode>/<timestamp>/ inside this review_repo folder.
-- MeanEvaluation uses RDKit and related chemistry tooling; ensure those are installed.
+- The launcher will automatically load the pre-built image from tssr-smiles.tar.gz or tssr-smiles.tar if the tag tssr-smiles:latest is not already present.
+- Profiles use fixed seeds for reproducibility.
+
+
+## Reproducible experiment profiles
+These profile names are routed by entrypoint.sh and ultimately call RunScript.py with fixed random seeds:
+- PRL-Run1 … PRL-Run5 — Pure RL (skips Lightning pretraining)
+- FRL-Run1 … FRL-Run5 — Finetune with Lightning, then RL
+
+Examples
+- Pure RL, third seed: ./run_docker.sh --gpu PRL-Run3
+- Finetune+RL, fifth seed: ./run_docker.sh --cpu FRL-Run5
+
+Behind the scenes
+- PRL profiles map to: python RunScript.py --pure-rl --seed <fixed>
+- FRL profiles map to: python RunScript.py --seed <fixed>
+
+
+## Persisting outputs beyond the container
+By default, outputs are written inside the container to:
+- RLPipeline/runs/<mode>/<timestamp>/
+This includes TensorBoard logs and sampled molecules.
+
+To persist on the host when using docker run directly, mount a volume
+- docker run --rm -it --gpus all \
+  -v "$PWD/data:/workspace/data" \
+  -v "$PWD/outputs:/workspace/RLPipeline/runs" \
+  tssr-smiles:latest PRL-Run1
+
+Alternatively, after a run, you can copy results out of the container with docker cp if you noted the container ID.
+
+The simple run_docker.sh wrapper does not mount host volumes by default to keep usage minimal. For persistent outputs, prefer the manual docker run shown above.
+
+
+## Manual commands
+Load the pre-built image manually (if you prefer not to use run_docker.sh)
+- gunzip -c tssr-smiles.tar.gz | docker load
+  or
+- docker load -i tssr-smiles.tar
+
+List profiles and help
+- docker run --rm -it tssr-smiles:latest help
+
+Run with GPU
+- docker run --rm -it --gpus all tssr-smiles:latest PRL-Run1
+
+Pass raw arguments to RunScript.py (bypass profiles)
+- docker run --rm -it --gpus all tssr-smiles:latest -- --pure-rl --seed 42
+
+Mount custom data and persist outputs together
+- docker run --rm -it --gpus all \
+  -v "$PWD/data:/workspace/data" \
+  -v "$PWD/outputs:/workspace/RLPipeline/runs" \
+  tssr-smiles:latest PRL-Run2
+
+
+## Expected outputs and runtime
+- Training progress and metrics are logged to RLPipeline/runs/<mode>/<timestamp>/.
+- Generated samples and evaluation summaries are written alongside logs.
+- GPU runs typically complete demo-scale profiles in minutes to tens of minutes; CPU runs are substantially slower.
+
+
+## Reproducibility notes
+- Fixed seeds per profile (see entrypoint.sh). For example, FRL-Run1 uses seed 1999133639; PRL-Run1 uses seed 640011233.
+- RunScript.py sets deterministic/cuDNN-safe flags where applicable and seeds all major RNGs (Python, NumPy, PyTorch CPU/CUDA, DataLoader workers).
+- The Docker image pins the CUDA/PyTorch toolchain (pytorch 2.5.1 + CUDA 12.1 wheels) via environment.yml.
+
+
+## Troubleshooting
+- Permission denied running the script
+  - Run chmod +x run_docker.sh
+- Docker "permission denied" without sudo
+  - Add your user to the docker group, then re-login; or prefix commands with sudo.
+- GPU not detected
+  - Check NVIDIA drivers and install the NVIDIA Container Toolkit. Test with docker run --rm --gpus all nvidia/cuda:12.1.0-base-ubuntu22.04 nvidia-smi
+- Image file not found by run_docker.sh
+  - Ensure tssr-smiles.tar.gz (or .tar) is in the project root. If your clone omitted large files, download the image from your project’s release or request it from the authors.
+- Slow training
+  - Use a GPU if available, reduce batch sizes, or try a PRL profile for a faster qualitative run.
+
+
+## Repository layout (for reference)
+- RunScript.py — main training/eval driver
+- RLPipeline/
+  - CharRNN.py, SequenceDataSet.py, SequenceEnv.py, MeanEvaluation.py, BulkGenerator.py
+- data/
+  - train.txt, test.txt, train.csv, test.csv (demo)
+- Dockerfile, environment.yml, entrypoint.sh, run_docker.sh, tssr-smiles.tar.gz

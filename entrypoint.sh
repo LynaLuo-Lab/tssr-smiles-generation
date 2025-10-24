@@ -1,16 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# === CHANGE THIS if your main script has a different path/name ===
 SCRIPT="python RunScript.py"
 
 show_help() {
   cat <<'EOF'
 Usage:
-  docker run --rm -it --gpus all drugdisc:review <profile-name>
-  docker run --rm -it --gpus all drugdisc:review help
+  docker run --rm -it --gpus all tssr-smiles:latest <profile-name>
+  docker run --rm -it --gpus all tssr-smiles:latest help
   # Or pass raw args to the script:
-  docker run --rm -it --gpus all drugdisc:review -- --your --raw --args
+  docker run --rm -it --gpus all tssr-smiles:latest -- --your --raw --args
 
 Available profiles:
   PRL-Run1
@@ -27,7 +26,6 @@ Available profiles:
 EOF
 }
 
-# Map profile -> arguments
 run_profile() {
   case "${1:-help}" in
     PRL-Run1)
@@ -63,10 +61,10 @@ run_profile() {
     help|--help|-h|"")
       show_help; exit 0
       ;;
-    --) # pass-through raw args after "--"
+    --)
       shift; exec ${SCRIPT} "$@"
       ;;
-    *)  # unknown profile -> treat as raw args
+    *)
       if [[ "${1}" == -* ]]; then
         exec ${SCRIPT} "$@"
       else
