@@ -24,7 +24,7 @@ You do not need to install Python, CUDA, or RDKit locally. Everything runs insid
 - tssr-smiles.tar.gz — the pre-built Docker image (Linux/amd64)
 
 
-## Scientific overview (brief)
+## Scientific overview
 - Problem: sequence-based molecular generation with reinforcement learning (SMILES strings).
 - Model: character-level RNN generator trained with either (a) pure RL or (b) finetune + RL.
 - Policy optimization: PPO via Tianshou.
