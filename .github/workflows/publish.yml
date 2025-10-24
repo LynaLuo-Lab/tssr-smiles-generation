@@ -3,11 +3,11 @@ name: Publish image to GHCR
 on:
   workflow_dispatch:
   push:
-    branches: [ main ]   # change if your default branch differs
+    branches: [ main ]
 
 permissions:
   contents: read
-  packages: write        # <-- critical for pushing to GHCR
+  packages: write
 
 jobs:
   build-and-push:
@@ -15,6 +15,9 @@ jobs:
     steps:
       - name: Check out
         uses: actions/checkout@v4
+        with:
+          lfs: true
+          fetch-depth: 0
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
