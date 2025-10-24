@@ -1,35 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-IMAGE="tssr-smiles:latest"
-ARCH_HINT="linux/amd64"  # change to your build arch; if you built on Intel, keep amd64
-
-# Path to the saved image file (adjust if you put it elsewhere)
-PKG_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-TAR_GZ="${PKG_DIR}/tssr-smiles.tar.gz"
-TAR_RAW="${PKG_DIR}/tssr-smiles.tar"
+# GHCR image published by CI from this repository
+IMAGE="ghcr.io/lynaluo-lab/tssr-smiles-generation:latest"
 
 have_image() {
   docker image inspect "$IMAGE" >/dev/null 2>&1
 }
 
-load_image() {
-  if [[ -f "$TAR_GZ" ]]; then
-    echo ">> Loading Docker image from ${TAR_GZ}..."
-    gunzip -c "$TAR_GZ" | docker load
-  elif [[ -f "$TAR_RAW" ]]; then
-    echo ">> Loading Docker image from ${TAR_RAW}..."
-    docker load -i "$TAR_RAW"
-  else
-    echo "!! Could not find image file (expected ${TAR_GZ} or ${TAR_RAW})." >&2
-    echo "   Please download it (see README) and place it next to this script." >&2
-    exit 1
-  fi
-}
-
-# Load image if missing
+# Ensure image is available locally; pull if missing.
 if ! have_image; then
-  load_image
+  echo ">> Pulling ${IMAGE} from GHCR..."
+  docker pull "$IMAGE"
 fi
 
 # GPU toggle:

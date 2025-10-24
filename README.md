@@ -1,8 +1,8 @@
 # TSSR-SMILES: Reproducible Package for Sequence-Based Molecular Generation with RL
 
 This repository provides a compact, reproduction package for the TSSR-SMILES project. It bundles:
-- A pre-built Docker image (tssr-smiles:latest) saved as tssr-smiles.tar.gz in the project root.
-- A one-step launcher script run_docker.sh that automatically loads the image (if needed) and runs curated experiment profiles.
+- A pre-built Docker image published to GitHub Container Registry: ghcr.io/lynaluo-lab/tssr-smiles-generation:latest.
+- A one-step launcher script run_docker.sh that automatically pulls the image from GHCR (if needed) and runs curated experiment profiles.
 - The minimal source files required to execute the training and evaluation pipeline end-to-end on the dataset (under data/).
 
 You do not need to install Python, CUDA, or RDKit locally. Everything runs inside the provided container.
@@ -20,8 +20,7 @@ You do not need to install Python, CUDA, or RDKit locally. Everything runs insid
   - data/train.txt, data/test.txt, data/train.csv, data/test.csv
 - Dockerfile, environment.yml — reproducible container build spec (for transparency)
 - entrypoint.sh — profile router used by the image
-- run_docker.sh — convenience wrapper to load and run the pre-built image
-- tssr-smiles.tar.gz — the pre-built Docker image (Linux/amd64)
+- run_docker.sh — convenience wrapper to pull and run the GHCR image
 
 
 ## Scientific overview
@@ -58,9 +57,15 @@ reward design, and resulting samples without requiring multi-GPU infrastructure.
 - ./run_docker.sh --cpu PRL-Run1
 
 Notes
-- The launcher will automatically load the pre-built image from tssr-smiles.tar.gz or tssr-smiles.tar if the tag tssr-smiles:latest is not already present.
+- The launcher will automatically pull ghcr.io/lynaluo-lab/tssr-smiles-generation:latest if it is not already present locally.
 - Profiles use fixed seeds for reproducibility.
 
+## Container image and CI/CD
+- This repository is connected to GitHub Container Registry (GHCR). On pushes to main or manual dispatch, GitHub Actions builds the Docker image from the Dockerfile and publishes it.
+- Workflow: .github/workflows/publish.yml
+- Image names and tags:
+  - ghcr.io/lynaluo-lab/tssr-smiles-generation:latest
+  - ghcr.io/lynaluo-lab/tssr-smiles-generation:sha-<commit-sha>
 
 ## Reproducible experiment profiles
 These profile names are routed by entrypoint.sh and ultimately call RunScript.py with fixed random seeds:
@@ -82,10 +87,10 @@ By default, outputs are written inside the container to:
 This includes TensorBoard logs and sampled molecules.
 
 To persist on the host when using docker run directly, mount a volume
-- docker run --rm -it --gpus all \
-  -v "$PWD/data:/workspace/data" \
-  -v "$PWD/outputs:/workspace/RLPipeline/runs" \
-  tssr-smiles:latest PRL-Run1
+- docker run --rm -it --gpus all 
+  -v "\$PWD/data:/workspace/data" 
+  -v "\$PWD/outputs:/workspace/RLPipeline/runs" 
+  ghcr.io/lynaluo-lab/tssr-smiles-generation:latest PRL-Run1
 
 Alternatively, after a run, you can copy results out of the container with docker cp if you noted the container ID.
 
@@ -93,25 +98,23 @@ The simple run_docker.sh wrapper does not mount host volumes by default to keep 
 
 
 ## Manual commands
-Load the pre-built image manually (if you prefer not to use run_docker.sh)
-- gunzip -c tssr-smiles.tar.gz | docker load
-  or
-- docker load -i tssr-smiles.tar
+Pull the image (if you prefer not to use run_docker.sh)
+- docker pull ghcr.io/lynaluo-lab/tssr-smiles-generation:latest
 
 List profiles and help
-- docker run --rm -it tssr-smiles:latest help
+- docker run --rm -it ghcr.io/lynaluo-lab/tssr-smiles-generation:latest help
 
 Run with GPU
-- docker run --rm -it --gpus all tssr-smiles:latest PRL-Run1
+- docker run --rm -it --gpus all ghcr.io/lynaluo-lab/tssr-smiles-generation:latest PRL-Run1
 
 Pass raw arguments to RunScript.py (bypass profiles)
-- docker run --rm -it --gpus all tssr-smiles:latest -- --pure-rl --seed 42
+- docker run --rm -it --gpus all ghcr.io/lynaluo-lab/tssr-smiles-generation:latest -- --pure-rl --seed 42
 
 Mount custom data and persist outputs together
-- docker run --rm -it --gpus all \
-  -v "$PWD/data:/workspace/data" \
-  -v "$PWD/outputs:/workspace/RLPipeline/runs" \
-  tssr-smiles:latest PRL-Run2
+- docker run --rm -it --gpus all 
+  -v "\$PWD/data:/workspace/data" 
+  -v "\$PWD/outputs:/workspace/RLPipeline/runs" 
+  ghcr.io/lynaluo-lab/tssr-smiles-generation:latest PRL-Run2
 
 
 ## Expected outputs and runtime
@@ -128,13 +131,13 @@ Mount custom data and persist outputs together
 
 ## Troubleshooting
 - Permission denied running the script
-  - Run chmod +x run_docker.sh
+  - Run: chmod +x run_docker.sh
 - Docker "permission denied" without sudo
   - Add your user to the docker group, then re-login; or prefix commands with sudo.
 - GPU not detected
-  - Check NVIDIA drivers and install the NVIDIA Container Toolkit. Test with docker run --rm --gpus all nvidia/cuda:12.1.0-base-ubuntu22.04 nvidia-smi
-- Image file not found by run_docker.sh
-  - Ensure tssr-smiles.tar.gz (or .tar) is in the project root. If your clone omitted large files, download the image from your project’s release or request it from the authors.
+  - Check NVIDIA drivers and install the NVIDIA Container Toolkit. Test with: docker run --rm --gpus all nvidia/cuda:12.1.0-base-ubuntu22.04 nvidia-smi
+- Cannot pull image from GHCR
+  - Check your internet connectivity and that the image name is correct: ghcr.io/lynaluo-lab/tssr-smiles-generation:latest. If the image is private or you encounter rate limits, run: docker login ghcr.io (use a GitHub token with read:packages), then retry.
 - Slow training
   - Use a GPU if available, reduce batch sizes, or try a PRL profile for a faster qualitative run.
 
@@ -145,4 +148,4 @@ Mount custom data and persist outputs together
   - CharRNN.py, SequenceDataSet.py, SequenceEnv.py, MeanEvaluation.py, BulkGenerator.py
 - data/
   - train.txt, test.txt, train.csv, test.csv (demo)
-- Dockerfile, environment.yml, entrypoint.sh, run_docker.sh, tssr-smiles.tar.gz
+- Dockerfile, environment.yml, entrypoint.sh, run_docker.sh

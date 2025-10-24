@@ -6,10 +6,10 @@ SCRIPT="python RunScript.py"
 show_help() {
   cat <<'EOF'
 Usage:
-  docker run --rm -it --gpus all tssr-smiles:latest <profile-name>
-  docker run --rm -it --gpus all tssr-smiles:latest help
+  docker run --rm -it --gpus all ghcr.io/lynaluo-lab/tssr-smiles-generation:latest <profile-name>
+  docker run --rm -it --gpus all ghcr.io/lynaluo-lab/tssr-smiles-generation:latest help
   # Or pass raw args to the script:
-  docker run --rm -it --gpus all tssr-smiles:latest -- --your --raw --args
+  docker run --rm -it --gpus all ghcr.io/lynaluo-lab/tssr-smiles-generation:latest -- --your --raw --args
 
 Available profiles:
   PRL-Run1
