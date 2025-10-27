@@ -1,4 +1,6 @@
 # TSSR-SMILES: Reproducible Package for Sequence-Based Molecular Generation with RL
+DOI: 10.5281/zenodo.17459452
+
 
 This repository provides a compact, reproduction package for the TSSR-SMILES project. It bundles:
 - A pre-built Docker image published to GitHub Container Registry: ghcr.io/lynaluo-lab/tssr-smiles-generation:latest.
