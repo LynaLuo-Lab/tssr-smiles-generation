@@ -1,5 +1,5 @@
 # TSSR-SMILES: Reproducible Package for Sequence-Based Molecular Generation with RL
-DOI: 10.5281/zenodo.17459452
+[![DOI](https://zenodo.org/badge/1080083417.svg)](https://doi.org/10.5281/zenodo.17459451)
 
 
 This repository provides a compact, reproduction package for the TSSR-SMILES project. It bundles:
