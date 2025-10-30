@@ -1,3 +1,18 @@
+"""
+Gymnasium environment for sequence generation of SMILES strings with a
+hand‑crafted, two‑stage reward. The reward first ensures syntactic parsability
+and then attempts to reduce RDKit‑reported chemistry problems by single‑token
+substitutions. This file is heavily commented to make the reward shaping and
+termination rules easy to follow.
+
+Overview
+- Observation space: a single Discrete(vocab_size) representing the last token
+  emitted. The environment is purely auto‑regressive; the policy keeps its own
+  memory (e.g. RNN hidden state).
+- Action space: Discrete(vocab_size), the next token to append.
+- Episode termination: when [EOS] is produced or when max_len is reached.
+- Reward: computed only at termination (sparse). See TwoStageReward for details.
+"""
 import math
 import random
 from collections import deque, Counter
@@ -14,6 +29,15 @@ from rdkit import Chem
 
 
 def clipped_power_swaps(s, N, m):
+    """Power-law decay schedule clipped to [0,1] for swap attempts.
+
+    Parameters
+    - s: current step/count
+    - N: total steps/maximum
+    - m: optional midpoint control; if None or not in (0,N), defaults to 0.5
+
+    Returns a float in [0,1] that decreases as s approaches N.
+    """
     if s >= N:
         return 0.0
 
@@ -35,7 +59,7 @@ def build_token_freq() -> np.ndarray:
     counter = Counter()
     specials = {"[BOS]", "[EOS]", "[PAD]"}
 
-    with open('data/train.txt', "r") as f:
+    with open('/home/abog/PycharmProjects/Drug-Discovery-Loss-Term/data/train.txt', "r") as f:
         for line in f:
             for tok in encoder.tokenize(line.strip()):
                 if tok not in specials:
@@ -53,6 +77,14 @@ def build_token_freq() -> np.ndarray:
 
 
 class SequenceEnv(Env):
+    """Single-token auto-regressive SMILES generation environment.
+
+    Parameters
+    - vocab: list of token strings; must contain [BOS] and [EOS]
+    - max_len: maximum number of actions per episode
+    - means: tuple of mean statistics (unused here but kept for compatibility)
+    - latent_dim, k_subst, alpha, beta, gamma: knobs for the reward function
+    """
     def __init__(self, vocab: list, max_len: int, means: tuple, latent_dim: int = None,
                  k_subst: int = 8, alpha: float = .2, beta: float = .5, gamma: float = .3):
 
@@ -73,12 +105,21 @@ class SequenceEnv(Env):
         self.np_random, _ = seeding.np_random(None)
 
     def reset(self, seed=None, options=None):
+        """Reset episode state and return initial observation ([BOS] token ID)."""
         super().reset(seed=seed)
         self.seq = []
         obs = np.int64(self.bos_id)
         return obs, {}
 
     def step(self, action):
+        """Append action token and return (obs, reward, terminated, truncated, info).
+
+        - obs: the last emitted token ID (np.int64)
+        - reward: 0.0 until termination/truncation; then TwoStageReward result
+        - terminated: True if [EOS] was just produced
+        - truncated: True if max_length reached
+        - info: empty dict reserved for extras
+        """
         action = int(action)
         self.seq.append(action)
         terminated = action == self.eos_id
@@ -96,6 +137,14 @@ class SequenceEnv(Env):
         pass
 
     def _reward_fn(self, sequence):
+        """Compute terminal reward for a finished token sequence.
+
+        The input `sequence` is a list of token IDs including the final action
+        that caused termination (typically [EOS] or a truncation step). We map
+        IDs to string tokens and drop the last item before scoring so that the
+        reward reflects the generated SMILES content and not the [EOS] marker.
+        Uses TwoStageReward over the character list.
+        """
         smiles = [self.vocab[i] for i in sequence]
         swaps_reward = self.two_stage_reward(smiles[:-1])
         return swaps_reward
@@ -110,6 +159,18 @@ class SequenceEnv(Env):
 
 
 class TwoStageReward:
+    """Two‑stage reward function used at episode end.
+
+    Stage 1: Ensure the token sequence parses syntactically as SMILES, attempting
+    minimal single‑token substitutions if it does not. If parsing cannot be
+    achieved, return a strong negative reward.
+
+    Stage 2: If syntactically valid, greedily try single‑token substitutions to
+    reduce the number of RDKit chemistry problems. The final reward combines:
+    - fewer failed swaps (encourages actionable edits)
+    - reduction in chemistry errors
+    - distance from "no problems" state (normalized)
+    """
 
     def __init__(self,
                  vocab: list[str],

@@ -1,3 +1,16 @@
+"""
+Character-level GRU language model used for SMILES generation and a matching
+value head (Critic). This file focuses on clarity and shape annotations to make
+it easy to follow the data flow through the network during training and
+inference.
+
+Conventions
+- Inputs are integer token IDs, shape [batch, time]. If a float one‑hot tensor
+  is passed in, it will be converted to IDs via argmax along the last dim.
+- The recurrent state uses GRU with shape [num_layers, batch, hidden_size].
+- The forward() returns (logits, new_state), where logits are
+  [batch, time, vocab_size] and new_state is [batch, num_layers, hidden_size].
+"""
 import copy
 from lightning.pytorch import LightningModule
 import torch
@@ -8,11 +21,24 @@ import numpy as np
 
 
 def confidence_penalty(logits, beta=0.1):
+    """Entropy regularization that penalizes over‑confident distributions.
+
+    Parameters
+    - logits: unnormalized scores of shape [B, T, V]
+    - beta: scaling factor for the penalty
+
+    Returns a scalar penalty to be added to the loss (encourages higher entropy).
+    """
     P = F.softmax(logits, dim=-1)
     H = -(P * torch.log(P + 1e-12)).sum(dim=-1)
     return -beta * H.mean()
 
 class CharRNNModel(LightningModule):
+    """GRU-based character language model producing next-token logits.
+
+    Attributes (saved as hparams):
+    - vocab_size, embedding_dim, hidden_size, num_layers, dropout, lr, pad_idx
+    """
     def __init__(self, vocab_size, num_layers, pad_idx, lr=None, hidden_size=1024, dropout=0.2, embedding_dim=128):
         super().__init__()
         self.save_hyperparameters()
@@ -29,6 +55,19 @@ class CharRNNModel(LightningModule):
         self._init_gru_weights()
 
     def forward(self, x, state=None, info = {}):
+        """Run the GRU language model forward pass.
+
+        Parameters
+        - x: input tokens; accepts LongTensor [B, T] of token IDs or one‑hot
+          float tensor [B, T, V] (will be argmaxed to IDs). 1‑D inputs are
+          unsqueezed to [B, 1]. NumPy arrays are converted to tensors.
+        - state: optional initial hidden state, shape [L, B, H] or [B, L, H].
+        - info: reserved dictionary for future extensions (ignored).
+
+        Returns
+        - logits: FloatTensor of shape [B, T, V] (next‑token scores)
+        - new_state: hidden state as [B, L, H]
+        """
         hidden = state
         if isinstance(x, np.ndarray):
             x = torch.from_numpy(x)
@@ -52,6 +91,11 @@ class CharRNNModel(LightningModule):
         return self.linear(cat), hidden
 
     def training_step(self, batch, batch_idx):
+        """One training iteration: compute CE loss (+ entropy penalty) and log.
+
+        Expects batch=(x, y) where x,y are LongTensors [B, T]. Returns a scalar
+        loss suitable for backprop; also logs to Lightning's progress bar.
+        """
         x, y = batch
         target = y
         hidden = self.init_hidden(x.size(0), x.device)
@@ -63,6 +107,11 @@ class CharRNNModel(LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx):
+        """Validation iteration mirroring training loss without entropy term.
+
+        Computes cross-entropy over next-token prediction and logs val_loss on
+        epoch. Expects batch=(x, y) as LongTensors [B, T].
+        """
         x, y = batch
         target = y
         hidden = self.init_hidden(x.size(0), x.device)

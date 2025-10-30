@@ -1,8 +1,30 @@
+"""
+Bulk sequence generator for autoregressive token models.
+
+This module provides a very small, dependency‑free wrapper around a PyTorch
+sequence model to generate batches of token IDs either greedily (argmax) or via
+sampling from the softmax distribution. It intentionally does not perform any
+post‑processing; the caller is expected to interpret EOS/PAD tokens.
+
+Key points for readers:
+- Input: a model with signature logits, state = model(tokens, state)
+  where `tokens` is [batch, time] of integer token IDs and logits are
+  [batch, time, vocab_size].
+- Output: a tensor of shape [n, max_len] containing generated token IDs.
+- The first step is seeded with a single [BOS] token for every sequence.
+- Generation runs under torch.inference_mode() to avoid autograd overhead.
+"""
 import torch, torch.nn as nn
 import torch.nn.functional as F
-from typing import List
-
 class Generator:
+    """Lightweight batch generator for autoregressive models.
+
+    Parameters
+    - model: nn.Module implementing forward(tokens, state) -> (logits, new_state)
+    - bos_id: integer ID of the [BOS] token to start each sequence
+    - eos_id: integer ID of the [EOS] token used to optionally stop early
+    - max_len: maximum number of tokens to sample per sequence
+    """
     def __init__(self, model: nn.Module, bos_id: int, eos_id: int, max_len: int):
         self.model = model
         self.bos = bos_id
@@ -17,7 +39,7 @@ class Generator:
         """
         device = next(self.model.parameters()).device
         self.model.eval()
-        with torch.no_grad():
+        with torch.inference_mode():
             # 1) init hidden state
             h = self.model.init_hidden(batch_size=n, device=device)
 
