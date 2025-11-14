@@ -1,167 +1,295 @@
 """
-Efficient text dataset and tokenizer utilities for SMILES/SELFIES sequences.
+Gymnasium environment for sequence generation of SMILES strings with a
+hand‑crafted, two‑stage reward. The reward first ensures syntactic parsability
+and then attempts to reduce RDKit‑reported chemistry problems by single‑token
+substitutions. This file is heavily commented to make the reward shaping and
+termination rules easy to follow.
 
-This module defines two main components:
-- LabelEncoder: a regex‑based tokenizer for a fixed SMILES vocabulary with
-  robust encode/decode helpers.
-- SequenceDataset: a memory‑efficient line dataset that uses a precomputed
-  byte offset index (.idx sidecar file) to seek lines on demand. It yields
-  (input, target) pairs suitable for next‑token prediction.
-
-Design goals:
-- Multiprocessing‑safe lazy file access in __getitem__ to support DataLoader workers.
-- Minimal memory footprint even for large files, thanks to the offsets index.
-- Optional SELFIES mode that builds its vocabulary from the data.
+Overview
+- Observation space: a single Discrete(vocab_size) representing the last token
+  emitted. The environment is purely auto‑regressive; the policy keeps its own
+  memory (e.g. RNN hidden state).
+- Action space: Discrete(vocab_size), the next token to append.
+- Episode termination: when [EOS] is produced or when max_len is reached.
+- Reward: computed only at termination (sparse). See TwoStageReward for details.
 """
-import os
-import re
-from typing import List, Tuple
-import selfies as sf
-import torch
-from torch.utils.data import Dataset
+import math
+import random
+from collections import deque, Counter
+from typing import Any
+
+from gymnasium.utils import seeding
+from sympy import false
+
+from .SequenceDataSet import LabelEncoder
+import numpy as np, torch
+from gymnasium import spaces, Env
+from rdkit import Chem
 
 
-class LabelEncoder:
-    """Simple encoder that maps each symbol in `characters` to an integer label.
 
-    Notes
-    - The `characters` list contains multi‑character SMILES tokens (e.g. "Cl",
-      "Br") and single characters. Tokenization is done via a regex that
-      prioritizes longer tokens first to avoid splitting multi‑char symbols.
-    - Special tokens are [BOS] (begin‑of‑sequence), [EOS] (end‑of‑sequence),
-      and [PAD] (padding). They are part of the vocabulary but typically not
-      present in raw training text.
+def clipped_power_swaps(s, N, m):
+    """Power-law decay schedule clipped to [0,1] for swap attempts.
+
+    Parameters
+    - s: current step/count
+    - N: total steps/maximum
+    - m: optional midpoint control; if None or not in (0,N), defaults to 0.5
+
+    Returns a float in [0,1] that decreases as s approaches N.
     """
+    if s >= N:
+        return 0.0
 
-    # Ordered, non‑overlapping vocabulary.  If you need to add symbols, just
-    # extend this list; the indices are derived automatically.
-    characters: List[str] = [
-        "[BOS]", "Br", "N", ")", "c", "o", "6",
-        "s", "Cl", "=", "2", "]", "C", "n", "O",
-        "4", "1", "#", "S", "F", "3", "[", "5",
-        "H", "(", "-", "[EOS]", "[PAD]",
-    ]
-    _special = {"[PAD]", "[BOS]", "[EOS]"}
+    # compute shape parameter
+    if m is None or m <= 0 or m >= N:
+        gamma = 1.0
+    else:
+        gamma = math.log(0.5) / math.log(1 - m / N)
 
-    def __init__(self):
-        # character → integer and inverse
-        self.cti = {ch: i for i, ch in enumerate(self.characters)}
-        self.itc = {i: ch for ch, i in self.cti.items()}
-        # Regex tokenizer compiled lazily
-        self._token_re = None
+    # power‐law decay
+    return (1 - s / N) ** gamma
 
-    @property
-    def vocab_size(self) -> int:
-        """Number of symbols in the vocabulary."""
-        return len(self.characters)
+def build_token_freq() -> np.ndarray:
+    """
+    Count every token in `path` except the three specials.
+    Returns freq[i] aligned with encoder.characters, dtype=float, sum = 1.
+    """
+    encoder = LabelEncoder()
+    counter = Counter()
+    specials = {"[BOS]", "[EOS]", "[PAD]"}
 
-    def encode(self, text: str) -> torch.Tensor:
-        """Return a 1‑D LongTensor with integer labels for `text`.
+    with open('/home/abog/PycharmProjects/Drug-Discovery-Loss-Term/data/train.txt', "r") as f:
+        for line in f:
+            for tok in encoder.tokenize(line.strip()):
+                if tok not in specials:
+                    counter[tok] += 1
 
-        The function tokenizes the input with a regex that matches the longest
-        valid tokens first, which is important for multi‑character tokens like
-        "Cl" and "Br".
+    # map counts onto a vector the size of the vocab
+    freq = np.zeros(encoder.vocab_size, dtype=float)
+    for tok, cnt in counter.items():
+        freq[encoder.cti[tok]] = cnt
+
+    total = freq.sum()
+    if total == 0:
+        raise ValueError("No non-special tokens counted!")
+    return freq / total
+
+
+class SequenceEnv(Env):
+    """Single-token auto-regressive SMILES generation environment.
+
+    Parameters
+    - vocab: list of token strings; must contain [BOS] and [EOS]
+    - max_len: maximum number of actions per episode
+    - means: tuple of mean statistics (unused here but kept for compatibility)
+    - latent_dim, k_subst, alpha, beta, gamma: knobs for the reward function
+    """
+    def __init__(self, vocab: list, max_len: int, means: tuple, latent_dim: int = None,
+                 k_subst: int = 8, alpha: float = .2, beta: float = .5, gamma: float = .3):
+
+        self.max_length = max_len
+        self.vocab = vocab
+        self.eos_id = vocab.index('[EOS]')
+        self.bos_id = vocab.index('[BOS]')
+        self.vocab_size = len(self.vocab)
+        self.means = means
+        self.observation_space = spaces.Discrete(len(self.vocab))
+        self.action_space = spaces.Discrete(self.vocab_size)
+        self.k_subst = k_subst
+        self.alpha = alpha
+        self.beta = beta
+        self.gamma = gamma
+        self.two_stage_reward = TwoStageReward(vocab=self.vocab, k_subst=self.k_subst,
+                                               alpha=self.alpha, beta=self.beta, gamma=self.gamma)
+        self.np_random, _ = seeding.np_random(None)
+
+    def reset(self, seed=None, options=None):
+        """Reset episode state and return initial observation ([BOS] token ID)."""
+        super().reset(seed=seed)
+        self.seq = []
+        obs = np.int64(self.bos_id)
+        return obs, {}
+
+    def step(self, action):
+        """Append action token and return (obs, reward, terminated, truncated, info).
+
+        - obs: the last emitted token ID (np.int64)
+        - reward: 0.0 until termination/truncation; then TwoStageReward result
+        - terminated: True if [EOS] was just produced
+        - truncated: True if max_length reached
+        - info: empty dict reserved for extras
         """
-        tokens = self.tokenize(text.strip())
-        return torch.tensor([self.cti[t] for t in tokens], dtype=torch.long)
+        action = int(action)
+        self.seq.append(action)
+        terminated = action == self.eos_id
+        truncated = len(self.seq) >= self.max_length
+        done = terminated or truncated
+        reward = self._reward_fn(self.seq) if done else 0.0
+        obs = np.int64(action)
+        # Important: return the correct truncated flag so the collector can reset properly
+        return obs, reward, terminated, truncated, {}
 
-    def decode(self, labels: torch.Tensor) -> str:
-        """Inverse of :py:meth:`encode`.  Works on 1‑D tensors."""
-        return "".join(self.itc[int(idx)] for idx in labels)
+    def render(self):
+        return "".join(self.vocab[i] for i in self.seq)
 
-    @property
-    def special_ids(self) -> set[int]:
-        """{int indices} of PAD/BOS/EOS inside the vocabulary."""
-        return {self.cti[tok] for tok in self._special}
+    def close(self):
+        pass
 
-    def is_special(self, token: str) -> bool:
-        """Return True if `token` is one of the special markers."""
-        return token in self._special
+    def _reward_fn(self, sequence):
+        """Compute terminal reward for a finished token sequence.
 
-    def tokenize(self, text: str) -> List[str]:
-        """Split `text` into SMILES tokens using a compiled regex."""
-        if self._token_re is None:
-            pattern = "|".join(sorted(map(re.escape, self.characters), key=len, reverse=True))
-            self._token_re = re.compile(pattern)
-        return self._token_re.findall(text)
+        The input `sequence` is a list of token IDs including the final action
+        that caused termination (typically [EOS] or a truncation step). We map
+        IDs to string tokens and drop the last item before scoring so that the
+        reward reflects the generated SMILES content and not the [EOS] marker.
+        Uses TwoStageReward over the character list.
+        """
+        smiles = [self.vocab[i] for i in sequence]
+        swaps_reward = self.two_stage_reward(smiles[:-1])
+        return swaps_reward
+
+    def seed(self, seed):
+        self.np_random, seed = seeding.np_random(seed)  # official helper
+        # make every RNG in your stack deterministic too
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
 
 
-class SequenceDataset(Dataset):
-    """Line‑by‑line text dataset that returns *(input, target)* label tensors.
+class TwoStageReward:
+    """Two‑stage reward function used at episode end.
 
-    Example
-    >>> ds = SequenceDataset("data/smiles.txt")
-    >>> x, y = ds[0]  # x, y are 1‑D LongTensors of equal length
+    Stage 1: Ensure the token sequence parses syntactically as SMILES, attempting
+    minimal single‑token substitutions if it does not. If parsing cannot be
+    achieved, return a strong negative reward.
 
-    In SELFIES mode, the vocabulary is built from the dataset and the
-    encoding uses `selfies_to_encoding`.
+    Stage 2: If syntactically valid, greedily try single‑token substitutions to
+    reduce the number of RDKit chemistry problems. The final reward combines:
+    - fewer failed swaps (encourages actionable edits)
+    - reduction in chemistry errors
+    - distance from "no problems" state (normalized)
     """
 
-    def __init__(self, path: str, *, is_selfies: bool = False):
-        self.path = path
-        self.is_selfies = is_selfies
+    def __init__(self,
+                 vocab: list[str],
+                 store_threshold: int = 3,
+                 cache_size: int = 200,
+                 k_subst: int = 8,
+                 alpha: float = 0.3,
+                 beta: float = 0.5,
+                 gamma: float = 0.2,):
+        self.alpha = alpha
+        self.beta = beta
+        self.gamma = gamma
+        self.vocab = vocab
+        self.probs = build_token_freq()
+        self.k_subst = k_subst
+        self.store_thr = store_threshold
+        self.near_valid_cache = deque(maxlen=cache_size)
 
-        # Build or load a lightweight byte‑offset index for fast random access
-        idx_path = f"{path}.idx"
-        if os.path.exists(idx_path):
-            # Load index tensor safely; weights_only=True avoids pickle usage in new PyTorch versions
-            self.offsets = torch.load(idx_path, weights_only=True)
+    def __call__(self, smiles: list) -> float:
+        """Compute reward and maybe cache the molecule."""
+        initially_working, fixed, mol = self._syntax_and_errors(smiles)
+
+        if initially_working:
+            failed_swaps, err_diff, distance_from_no_problems = self._try_reduce_chem_problems(mol)
+            failed_swaps_term = 1.0/(1 + failed_swaps)
+            err_diff_term = err_diff
+            return self.alpha * failed_swaps_term + self.beta * err_diff_term + self.gamma * distance_from_no_problems
+        elif fixed:
+            failed_swaps, err_diff, distance_from_no_problems = self._try_reduce_chem_problems(mol)
+            failed_swaps_term = 1.0/(1 + failed_swaps)
+            err_diff_term = err_diff
+            invalid_penalty = -0.5
+            return -0.5 + self.alpha * failed_swaps_term + self.beta * err_diff_term + self.gamma * distance_from_no_problems
         else:
-            offsets, offset = [], 0
-            with open(path, "rb") as fh:
-                for line in fh:
-                    offsets.append(offset)
-                    offset += len(line)
-            self.offsets = torch.tensor(offsets, dtype=torch.long)
-            torch.save(self.offsets, idx_path)
+            return -1.0
 
-        # Read the raw lines to optionally inspect SELFIES length/vocabulary
-        with open(path, "r", encoding="utf‑8") as fh:
-            raw_lines = [ln.strip() for ln in fh]
 
-        if is_selfies:
-            # Dynamically build a vocabulary from the SELFIES alphabet
-            alphabet = sf.get_alphabet_from_selfies(raw_lines)
-            alphabet.add("[PAD]")
-            self.alphabet = sorted(alphabet)
-            self.sym2idx = {s: i for i, s in enumerate(self.alphabet)}
-            # Longest SELFIES length for optional padding/use (not applied here)
-            self.pad_to_len = max(sf.len_selfies(s) for s in raw_lines) if raw_lines else 0
-            self.vocab_size = len(self.alphabet)
+
+    def _syntax_and_errors(self, smi: list) -> tuple[bool, bool, Any | None]:
+        """
+        Returns (syntax_parses?, n_chem_errors)
+        Performs swaps if the initial string fails to parse.
+        """
+        mol = ''.join(smi)
+        m = Chem.MolFromSmiles(mol, sanitize=False)
+        initially_working = True
+        fixed = False
+        if m is None:
+            initially_working = False
+            smil = self._try_syntax_fix(smi)
+            if smil is None:
+                return initially_working, fixed, None
+            else:
+                fixed = True
+                return initially_working, fixed, smil
         else:
-            self.encoder = LabelEncoder()
-            self.vocab_size = self.encoder.vocab_size
+            return initially_working, fixed, smi
 
-        # file handle will be opened lazily inside __getitem__ (important for workers)
-        self._fh = None
+    def _try_syntax_fix(self, smi: list) -> list | None:
+        """
+        Attempt to repair syntax with character substitutions.
+        Returns the new SMILES if parsing succeeds, else None.
+        """
+        chars = smi.copy()
+        for pos in random.sample(range(len(chars)), len(chars)):
+            cands = self._sample_unique_tokens()
+            original = chars[pos]
+            for new_c in cands:
+                if new_c == original:
+                    continue
+                chars[pos] = new_c
+                if Chem.MolFromSmiles(''.join(chars), sanitize=False) is not None:
+                    return chars
+            chars[pos] = original
+        return None
 
-    def __len__(self) -> int:
-        return len(self.offsets)
+    def _sample_unique_tokens(self) -> list[str]:
+        """k-substitutes, weighted by dataset frequency, no duplicates."""
+        idxs = np.random.choice(len(self.vocab),
+                                size=min(self.k_subst, (self.probs > 0).sum()),
+                                replace=False,
+                                p=self.probs)
+        return [self.vocab[i] for i in idxs]
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Lazy open (multiprocessing‑safe)
-        if self._fh is None:
-            self._fh = open(self.path, "r", encoding="utf‑8")
+    def _try_reduce_chem_problems(self, smi: list) -> tuple[int, float, float]:
+        chars = smi.copy()
+        best_mol = Chem.MolFromSmiles(''.join(chars), sanitize=False)
+        best_err = len(Chem.DetectChemistryProblems(best_mol))
+        initial_err = len(Chem.DetectChemistryProblems(best_mol))
 
-        # Seek + read one logical line
-        self._fh.seek(int(self.offsets[idx]))
-        line = self._fh.readline().strip()
+        if 0 < initial_err <= self.store_thr:
+            self.near_valid_cache.append(best_mol)
 
-        # Encode to label tensor
-        labels = self._encode(line)
+        fail_swaps = 0
+        if best_err == 0:
+            return 0, 0 , 1.0
 
-        # Predict next‑token distribution at each position
-        return labels[:-1], labels[1:]
+        for pos in random.sample(range(len(chars)), len(chars)):
+            cands = self._sample_unique_tokens()
+            original = chars[pos]
+            for new_c in cands:
+                if new_c == original:
+                    continue
 
-    def _encode(self, text: str) -> torch.Tensor:
-        """Encode a single string to integer labels depending on mode."""
-        if self.is_selfies:
-            labels, _ = sf.selfies_to_encoding(
-                text,
-                vocab_stoi=self.sym2idx,
-                pad_to_len=-1,
-                enc_type="labels",
-            )
-            return torch.tensor(labels, dtype=torch.long)
-        else:
-            return self.encoder.encode(text)
+                chars[pos] = new_c
+                cand_mol = Chem.MolFromSmiles(''.join(chars), sanitize=False)
+                if cand_mol is None:
+                    chars[pos] = original
+                    fail_swaps += 1
+                    continue
+
+                n_err = len(Chem.DetectChemistryProblems(cand_mol))
+                if n_err < best_err:
+                    best_err = n_err
+                    best_mol = cand_mol
+                    if best_err == 0:
+                        return fail_swaps, (initial_err - best_err)/initial_err, 1.0 - (best_err / 12)
+                    break
+                else:
+                    chars[pos] = original
+                    fail_swaps += 1
+        return fail_swaps, (initial_err - best_err)/initial_err, 1.0 - (best_err / 12)

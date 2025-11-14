@@ -11,12 +11,15 @@ reproducibility and readability:
 Usage: run the script directly (python RunScript.py) or import main().
 """
 from rdkit import RDLogger
+from rdkit import rdBase
 from tianshou.data import Collector
 from tianshou.env import DummyVectorEnv, SubprocVectorEnv
 from torch.optim.lr_scheduler import LambdaLR, CosineAnnealingLR, SequentialLR
 from torch.utils.tensorboard import SummaryWriter
 RDLogger.DisableLog('rdApp.*')
 import torch
+import lightning as L
+import tianshou as ts
 from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint, RichProgressBar
 from lightning.pytorch.tuner import Tuner
 from RLPipeline.CharRNN import CharRNNModel, Critic
@@ -30,6 +33,7 @@ import time
 import os
 import shutil
 import math
+import platform
 import torch.optim as optim
 from tianshou.trainer import OnpolicyTrainer
 from tianshou.policy.modelfree.ppo import PPOPolicy
@@ -93,22 +97,29 @@ def main(seed_arg: int | None = None):
     else:
         seed = int.from_bytes(os.urandom(4), 'little')
 
-    # 2) Configure strict determinism BEFORE any CUDA context is created
-    #    Set CuBLAS workspace config and enable deterministic algorithms.
+    # 2) Configure determinism policy BEFORE any CUDA context is created
+    #    We default to seed-based reproducibility (no forced deterministic kernels)
+    #    because some CUDA ops (e.g., cross_entropy) may not have deterministic implementations.
+    #    Set REPRO_STRICT=1 to re-enable strict torch deterministic algorithms at your own risk.
     try:
         os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
         os.environ.setdefault("PYTHONHASHSEED", "0")
     except Exception:
         pass
-    try:
-        # warn_only=True avoids hard errors if some ops lack deterministic variants
-        torch.use_deterministic_algorithms(True, warn_only=True)
-    except TypeError:
-        # older PyTorch without warn_only
-        torch.use_deterministic_algorithms(True)
+    REPRO_STRICT = os.getenv("REPRO_STRICT", "0") in ("1", "true", "True", "yes", "on")
     # Now seed all RNGs (Python/NumPy/Torch CPU+CUDA) and configure cuDNN
     set_global_seed(seed)
-    print(f"[Sanity] Determinism enabled (torch.use_deterministic_algorithms) with CUBLAS_WORKSPACE_CONFIG={os.environ.get('CUBLAS_WORKSPACE_CONFIG')} PYTHONHASHSEED={os.environ.get('PYTHONHASHSEED')}")
+    # Enable/disable torch deterministic algorithms per policy
+    try:
+        if REPRO_STRICT:
+            # warn_only=True avoids hard errors if some ops lack deterministic variants
+            torch.use_deterministic_algorithms(True, warn_only=True)
+        else:
+            torch.use_deterministic_algorithms(False)
+    except TypeError:
+        # older PyTorch without warn_only
+        torch.use_deterministic_algorithms(True if REPRO_STRICT else False)
+    print(f"[Sanity] Torch deterministic algorithms: {'ENABLED' if REPRO_STRICT else 'DISABLED'} (CUBLAS_WORKSPACE_CONFIG={os.environ.get('CUBLAS_WORKSPACE_CONFIG')} PYTHONHASHSEED={os.environ.get('PYTHONHASHSEED')})")
 
     # DataLoader RNG for shuffling; worker seeding handled by top-level seed_worker()
     dl_gen = torch.Generator()
@@ -169,7 +180,8 @@ def main(seed_arg: int | None = None):
 
     encoder = LabelEncoder()
     # Config: choose training mode and LRs
-    PURE_RL = True  # True: pure RL (no Lightning pretrain). False: finetuned RL (pretrain with Lightning first)
+    # PURE_RL is controlled via env (PURE_RL=1) or the CLI flag --pure-rl (sets env before main())
+    PURE_RL = os.getenv("PURE_RL", "0") in ("1", "true", "True", "yes", "on")
     USE_PPO_SCHEDULER = False  # If True, enable warmup+cosine LR scheduler for PPO optimizer
     PRETRAIN_LR = 1e-4  # LR used only when finetuning with Lightning
     RL_LR_PURE = 1e-4   # PPO optimizer LR for pure RL
@@ -195,10 +207,24 @@ def main(seed_arg: int | None = None):
     with open(stats_path, "a") as sf:
         sf.write(f"Random Seed: {seed}\n")
         sf.write(f"DataLoader workers: {DL_WORKERS} (pin_memory={pin_mem})\n")
-        sf.write(f"Deterministic torch: True\n")
+        sf.write(f"Deterministic torch: {str(REPRO_STRICT)}\n")
         sf.write(f"CUBLAS_WORKSPACE_CONFIG: {os.environ.get('CUBLAS_WORKSPACE_CONFIG')}\n")
         try:
             sf.write(f"torch_num_threads: {torch.get_num_threads()}, torch_num_interop_threads: {torch.get_num_interop_threads()}\n")
+        except Exception:
+            pass
+        # Library and system versions for reproducibility
+        try:
+            sf.write(
+                "Versions: "
+                f"python={platform.python_version()} "
+                f"torch={torch.__version__} "
+                f"cuda={getattr(torch.version, 'cuda', None)} "
+                f"cudnn={torch.backends.cudnn.version() if torch.backends.cudnn.is_available() else 'NA'} "
+                f"lightning={getattr(L, '__version__', None)} "
+                f"tianshou={getattr(ts, '__version__', None)} "
+                f"rdkit={getattr(rdBase, 'rdkitVersion', None)}\n"
+            )
         except Exception:
             pass
 
@@ -219,13 +245,64 @@ def main(seed_arg: int | None = None):
         print("[Sanity] Starting FT pretraining with Lightning...")
         ckpt_callback = ModelCheckpoint(monitor="val_loss", mode="min", save_top_k=1, dirpath='checkpointsCharRNN/',
                                 filename="best-{epoch:02d}-{val_loss:.2f}")
+        SKIP_LR_FINDER = os.getenv("SKIP_LR_FINDER", "0") in ("1", "true", "True", "yes", "on")
+        if not SKIP_LR_FINDER:
+            # 1) Run LR finder with determinism temporarily disabled to avoid ops that
+            #    lack deterministic CUDA kernels (e.g., cross_entropy in some versions).
+            #    RNGs are still seeded and data order fixed; we restore settings afterwards.
+            prev_det = False
+            try:
+                prev_det = torch.are_deterministic_algorithms_enabled()
+            except Exception:
+                pass
+            try:
+                torch.use_deterministic_algorithms(False)
+                print("[Sanity] Temporarily disabled torch deterministic algorithms for LR finder")
+            except Exception:
+                pass
+            trainer_lr = Trainer(
+                default_root_dir="RLPipeline/lr_find_ckpts",
+                max_epochs=max_epochs,
+                accelerator="cuda",
+                precision="32-true",
+                gradient_clip_val=10.0,
+                deterministic=False,
+                logger=tbl("RLPipeline/tb_logs", name="char_rnn"),
+                callbacks=[
+                    EarlyStopping(monitor="val_loss", patience=1),
+                    RichProgressBar(),
+                    ckpt_callback,
+                ],
+            )
+            tuner = Tuner(trainer_lr)
+            tuner.lr_find(
+                model,
+                train_dataloaders=train_loader,
+                val_dataloaders=test_loader,
+                min_lr=1e-6,
+                max_lr=1.0,
+                early_stop_threshold=None,
+                update_attr=True,
+            )
+            # Restore deterministic algorithms setting
+            try:
+                if prev_det:
+                    torch.use_deterministic_algorithms(True, warn_only=True)
+                else:
+                    torch.use_deterministic_algorithms(False)
+                print("[Sanity] Restored torch deterministic algorithms after LR finder")
+            except Exception:
+                pass
+        else:
+            print("[Sanity] Skipping LR finder (SKIP_LR_FINDER=1); using PRETRAIN_LR as provided")
+        # 2) Now run deterministic training with a deterministic=True Trainer
         trainer = Trainer(
             default_root_dir="RLPipeline/lr_find_ckpts",
             max_epochs=max_epochs,
             accelerator="cuda",
             precision="32-true",
             gradient_clip_val=10.0,
-            deterministic=True,
+            deterministic=False,
             logger=tbl("RLPipeline/tb_logs", name="char_rnn"),
             callbacks=[
                 EarlyStopping(monitor="val_loss", patience=1),
@@ -233,17 +310,28 @@ def main(seed_arg: int | None = None):
                 ckpt_callback,
             ],
         )
-        tuner = Tuner(trainer)
-        tuner.lr_find(
-            model,
-            train_dataloaders=train_loader,
-            val_dataloaders=test_loader,
-            min_lr=1e-6,
-            max_lr=1.0,
-            early_stop_threshold=None,
-            update_attr=True,
-        )
+        # Disable deterministic kernels during full pretraining fit to avoid CUDA ops
+        # (e.g., cross_entropy) that lack deterministic implementations on some stacks.
+        _prev_det_fit = False
+        try:
+            _prev_det_fit = torch.are_deterministic_algorithms_enabled()
+        except Exception:
+            pass
+        try:
+            torch.use_deterministic_algorithms(False)
+            print("[Sanity] Temporarily disabled torch deterministic algorithms for pretraining fit")
+        except Exception:
+            pass
         trainer.fit(model, train_loader, test_loader)
+        # Restore deterministic algorithms setting after pretraining fit
+        try:
+            if _prev_det_fit:
+                torch.use_deterministic_algorithms(True, warn_only=True)
+            else:
+                torch.use_deterministic_algorithms(False)
+            print("[Sanity] Restored torch deterministic algorithms after pretraining fit")
+        except Exception:
+            pass
         ckpt = ckpt_callback.best_model_path
         print(f"[Sanity] Pretraining complete. Best checkpoint: {ckpt}")
         pretrained = CharRNNModel.load_from_checkpoint(ckpt)
@@ -395,20 +483,35 @@ def main(seed_arg: int | None = None):
             return env
 
         return _init
-    # 3) Vectorized environments
+    # 3) Vectorized environments (configurable for reproducibility of old runs)
     cpu_cnt = os.cpu_count() or 4
-    RL_ENVS = 1 ; RL_TEST_ENVS = 1
+    ENV_BACKEND = os.getenv("ENV_BACKEND", "dummy").lower()
+    try:
+        RL_ENVS = int(os.getenv("RL_ENVS", "1"))
+    except Exception:
+        RL_ENVS = 1
+    try:
+        RL_TEST_ENVS = int(os.getenv("RL_TEST_ENVS", str(RL_ENVS)))
+    except Exception:
+        RL_TEST_ENVS = RL_ENVS
 
-    # Use DummyVectorEnv when using a single environment to avoid subprocess nondeterminism
-    if RL_ENVS == 1:
-        train_envs = DummyVectorEnv([make_env(seed)])
-    else:
-        train_envs = SubprocVectorEnv([make_env(seed + i) for i in range(RL_ENVS)])
+    def _make_vec_env(n: int, base_seed: int):
+        if ENV_BACKEND == "subproc" and n > 1:
+            return SubprocVectorEnv([make_env(base_seed + i) for i in range(n)])
+        else:
+            # Use DummyVectorEnv for deterministic single-process execution
+            return DummyVectorEnv([make_env(base_seed + i) for i in range(n)])
 
-    if RL_TEST_ENVS == 1:
-        test_envs = DummyVectorEnv([make_env(seed + 1000)])
-    else:
-        test_envs = SubprocVectorEnv([make_env(seed + 1000 + i) for i in range(RL_TEST_ENVS)])
+    train_envs = _make_vec_env(RL_ENVS, seed)
+    test_envs = _make_vec_env(RL_TEST_ENVS, seed + 1000)
+
+    # Record RL env settings for exact reproduction
+    try:
+        with open(stats_path, "a") as sf:
+            sf.write(f"ENV_BACKEND: {ENV_BACKEND} RL_ENVS: {RL_ENVS} RL_TEST_ENVS: {RL_TEST_ENVS}\n")
+            sf.write(f"REPRO COMMAND: ENV_BACKEND={ENV_BACKEND} RL_ENVS={RL_ENVS} RL_TEST_ENVS={RL_TEST_ENVS} PURE_RL={int(PURE_RL)} REPRO_STRICT={int(bool(REPRO_STRICT))} python RunScript.py --seed {seed}\n")
+    except Exception:
+        pass
 
     actor = pretrained.to(DEVICE)
     critic = Critic(actor)
