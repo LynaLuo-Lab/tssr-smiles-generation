@@ -29,34 +29,34 @@ EOF
 run_profile() {
   case "${1:-help}" in
     PRL-Run1)
-      exec ${SCRIPT} --pure-rl --seed 640011233
+      exec ${SCRIPT} --pure-rl --seed 1949262625
       ;;
     PRL-Run2)
-      exec ${SCRIPT} --pure-rl --seed 1789382160
+      exec ${SCRIPT} --pure-rl --seed 2683294732
       ;;
     PRL-Run3)
-      exec ${SCRIPT} --pure-rl --seed 3478580130
+      exec ${SCRIPT} --pure-rl --seed 1103657151
       ;;
     PRL-Run4)
-      exec ${SCRIPT} --pure-rl --seed 3015646651
+      exec ${SCRIPT} --pure-rl --seed 3321047177
       ;;
     PRL-Run5)
-      exec ${SCRIPT} --pure-rl --seed 1476376261
+      exec ${SCRIPT} --pure-rl --seed 4251184328
       ;;
     FRL-Run1)
-      exec ${SCRIPT} --seed 1999133639
+      exec ${SCRIPT} --seed 3368427155
       ;;
     FRL-Run2)
-      exec ${SCRIPT} --seed 1527591437
+      exec ${SCRIPT} --seed 190166649
       ;;
     FRL-Run3)
-      exec ${SCRIPT} --seed 1290877492
+      exec ${SCRIPT} --seed 2485260846
       ;;
     FRL-Run4)
-      exec ${SCRIPT} --seed 3923673192
+      exec ${SCRIPT} --seed 2120889288
       ;;
     FRL-Run5)
-      exec ${SCRIPT} --seed 1900098291
+      exec ${SCRIPT} --seed 1410668516
       ;;
     help|--help|-h|"")
       show_help; exit 0
